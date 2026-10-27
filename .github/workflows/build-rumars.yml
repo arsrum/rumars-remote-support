@@ -1,0 +1,188 @@
+name: Build Rumars Support (Windows x64)
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-rumars.yml', 'brand/**', 'tests/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  RUSTDESK_REF: '1.4.9'
+  FLUTTER_VERSION: '3.24.5'
+  LLVM_VERSION: '15.0.6'
+  VCPKG_COMMIT_ID: '120deac3062162151622ca4860575a33844ba10b'
+  VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
+jobs:
+  bridge:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test branding
+        run: |
+          python -m pip install pillow==11.3.0
+          python -m unittest discover -s tests -v
+      - uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          ref: ${{ env.RUSTDESK_REF }}
+          path: rustdesk
+          submodules: recursive
+          persist-credentials: false
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ca-certificates clang cmake curl gcc git g++ libclang-dev libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.75.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rustdesk
+          prefix-key: rumars-bridge
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.22.3'
+          cache: true
+      - name: Generate RustDesk Flutter bridge
+        shell: bash
+        working-directory: rustdesk
+        run: |
+          set -euo pipefail
+          cargo install cargo-expand --version 1.0.95 --locked
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
+          sed -i 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          (cd flutter && flutter pub get)
+          flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp flutter/macos/Runner/bridge_generated.h flutter/ios/Runner/bridge_generated.h
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-flutter-bridge
+          if-no-files-found: error
+          path: |
+            rustdesk/src/bridge_generated.rs
+            rustdesk/src/bridge_generated.io.rs
+            rustdesk/flutter/lib/generated_bridge.dart
+            rustdesk/flutter/lib/generated_bridge.freezed.dart
+            rustdesk/flutter/macos/Runner/bridge_generated.h
+            rustdesk/flutter/ios/Runner/bridge_generated.h
+  windows:
+    runs-on: windows-2022
+    needs: bridge
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          ref: ${{ env.RUSTDESK_REF }}
+          path: rustdesk
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustdesk-flutter-bridge
+          path: rustdesk
+      - name: Patch RustDesk and generate branded icons
+        shell: pwsh
+        run: |
+          python -m pip install pillow==11.3.0
+          python .\brand\apply.py .\rustdesk
+          if ($LASTEXITCODE -ne 0) { throw "Rumars brand patch failed" }
+      - uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: ${{ env.LLVM_VERSION }}
+      - uses: subosito/flutter-action@v2
+        id: flutter
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+      - name: Install custom RustDesk Flutter Windows engine
+        shell: pwsh
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          $engine = "${{ steps.flutter.outputs['CACHE-PATH'] }}\bin\cache\artifacts\engine\windows-x64-release"
+          Copy-Item -Path '.\windows-x64-release\*' -Destination $engine -Recurse -Force
+      - name: Apply upstream Flutter dropdown patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$(dirname "$(dirname "$(which flutter)")")"
+          git apply "$GITHUB_WORKSPACE/rustdesk/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.75.0'
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rustdesk
+          prefix-key: rumars-windows
+      - uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+      - name: Install native libraries
+        working-directory: rustdesk
+        shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        run: |
+          set -euo pipefail
+          "$VCPKG_ROOT/vcpkg" install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"
+      - name: Compile genuine branded RustDesk
+        working-directory: rustdesk
+        shell: pwsh
+        run: |
+          python .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          if ($LASTEXITCODE -ne 0) { throw 'RustDesk build failed' }
+          if (-not (Test-Path '.\flutter\build\windows\x64\runner\Release\rustdesk.exe')) { throw 'Compiled RustDesk EXE missing' }
+          Move-Item '.\flutter\build\windows\x64\runner\Release' '.\Release'
+      - name: Add virtual display driver
+        working-directory: rustdesk
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item '.\usbmmidd_v2\Win32' -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item '.\usbmmidd_v2\deviceinstaller64.exe', '.\usbmmidd_v2\deviceinstaller.exe', '.\usbmmidd_v2\usbmmidd.bat' -Force -ErrorAction SilentlyContinue
+          Move-Item '.\usbmmidd_v2' '.\Release\usbmmidd_v2'
+      - name: Set portable resources
+        working-directory: rustdesk
+        shell: pwsh
+        run: |
+          $resource = Get-ChildItem -Recurse -Filter Runner.res -File | Select-Object -First 1
+          if ($resource) { Copy-Item $resource.FullName '.\libs\portable\Runner.res' -Force }
+          $manifest = '.\res\manifest.xml'
+          if (Test-Path $manifest) {
+            (Get-Content $manifest) | Where-Object { $_ -notmatch 'dpiAware' } | Set-Content -Path $manifest -Encoding utf8
+          }
+      - name: Pack one self-extracting portable EXE
+        working-directory: rustdesk/libs/portable
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements.txt
+          python .\generate.py -f ../../Release/ -o . -e ../../Release/rustdesk.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Portable pack failed' }
+      - name: Export final EXE
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path .\dist -Force | Out-Null
+          Copy-Item '.\rustdesk\target\release\rustdesk-portable-packer.exe' '.\dist\Rumars-Support.exe'
+          if ((Get-Item '.\dist\Rumars-Support.exe').Length -lt 1000000) { throw 'Suspiciously small EXE' }
+          Get-FileHash '.\dist\Rumars-Support.exe' -Algorithm SHA256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Rumars-Support-Windows-x64
+          path: dist/Rumars-Support.exe
+          if-no-files-found: error
+          retention-days: 14
